@@ -288,46 +288,29 @@ Each exfiltrated DNS query follows this pattern:
 
 ### Example Session
 
-```
-┌─────────────────────────────────────┐
-│  C2 Operator                        │
-└─────────────────────────────────────┘
+**1. CLI Initialization**
 
-domain.com> CMD:systeminfo
+Starting the C2 server and loading existing logs:
 
-[>] Deploying: systeminfo
-[i] Command ID: 1
-[+] BIND reload successful: server reload successful
-[+] Command deployed successfully!
+![CLI Startup](./imgs/img1.png)
 
-[.] Fragment 1/5 for cmd 1 (session: DESKTOP-ABC) [1/5]
-[.] Fragment 2/5 for cmd 1 (session: DESKTOP-ABC) [2/5]
-[.] Fragment 3/5 for cmd 1 (session: DESKTOP-ABC) [3/5]
-[.] Fragment 4/5 for cmd 1 (session: DESKTOP-ABC) [4/5]
-[.] Fragment 5/5 for cmd 1 (session: DESKTOP-ABC) [5/5]
-[+] Command 1 COMPLETE! All 5 fragments received.
-[+] Output saved to: ./commands/cmd_1_DESKTOP-ABC_20251216_143022.txt
+**2. Deploying a Command**
 
-──────────────────────────────────────────────────
-EXFILTRATED DATA:
-Host Name:                 DESKTOP-ABC
-OS Name:                   Microsoft Windows 10 Pro
-OS Version:                10.0.19045 N/A Build 19045
-...
-──────────────────────────────────────────────────
+Sending a command to all agents:
 
-domain.com> status
+![Command Deployment](./imgs/img2.png)
 
-════════════════════════════════════
-  STATUS
-════════════════════════════════════
-  Next Command ID: 2
-  Total Sessions:  1
-  Complete:        1
-  Incomplete:      0
-  Total Fragments: 5
-════════════════════════════════════
-```
+**3. Agent Execution**
+
+Agent receiving and executing the command:
+
+![Agent Execution](./imgs/img3.png)
+
+**4. Viewing Exfiltrated Data**
+
+Using the `show` command to display all received data:
+
+![Show Command Output](./imgs/img4.png)
 
 ## Technical Details
 
