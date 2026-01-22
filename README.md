@@ -439,7 +439,7 @@ Starting the C2 server and loading existing logs:
 
 ![CLI Startup](./imgs/img1.png)
 
-**2. Commands Available**
+**2. Available Commands**
 
 Displaying the help command:
 
